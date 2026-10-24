@@ -1,0 +1,36 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 280px;
+  min-height: 168px;
+  background: #151c19;
+  color: #c5d2cb;
+  font-family: ui-monospace, monospace;
+}
+
+.shell {
+  padding: 22px 20px 20px;
+}
+
+.brand {
+  margin: 0;
+  font-size: 28px;
+  color: #e8f0ea;
+}
+
+.headline {
+  margin: 16px 0 0;
+  font-size: 22px;
+  color: #3f8f68;
+}
+
+.subline {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: #8fa398;
+}
