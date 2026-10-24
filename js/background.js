@@ -226,3 +226,434 @@ function isCategoryId(value) {
 function categoryLabel(id) {
   return CATEGORIES.find((cat) => cat.id === id)?.label ?? "Uncategorized";
 }
+
+const MAX_TICK_DELTA_MS = 45_000;
+const DEFAULT_IDLE_SECONDS = 60;
+const MAX_TITLE_LENGTH = 80;
+const WINDOW_ID_NONE = -1;
+
+function sanitizeTitle(title, maxLength) {
+  if (!title) return undefined;
+  const cleaned = title.replace(/\s+/g, " ").trim();
+  if (!cleaned) return undefined;
+  if (cleaned.length <= maxLength) return cleaned;
+  return `${cleaned.slice(0, maxLength - 1)}…`;
+}
+
+function assertSafeStoredSite(value) {
+  const joined = `${value.domain}\0${value.hostname ?? ""}`;
+  if (joined.includes("?") || joined.includes("#") || joined.includes("@")) {
+    throw new Error("Refusing to store URL query, hash, or credentials");
+  }
+  if (value.domain.includes("/") || value.hostname?.includes("/")) {
+    throw new Error("Refusing to store URL path in domain fields");
+  }
+}
+
+function toLocalDateKey(epochMs, timeZone) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(epochMs));
+}
+
+function defaultSettings() {
+  return {
+    idleSeconds: DEFAULT_IDLE_SECONDS,
+    productiveCategories: defaultProductiveCategories(),
+    categoryOverrides: {},
+    retentionDays: 90,
+    encryptionEnabled: false,
+  };
+}
+
+function emptyDay(date, now = Date.now()) {
+  return {
+    date,
+    totalActiveMs: 0,
+    byCategory: {},
+    byDomain: {},
+    tabSwitches: 0,
+    tabCountSamples: [],
+    updatedAt: now,
+  };
+}
+
+class PlainVault {
+  constructor() {
+    this.mode = "none";
+  }
+
+  async seal(id, payload) {
+    return {
+      id,
+      v: 1,
+      encryption: "none",
+      payload,
+      updatedAt: Date.now(),
+    };
+  }
+
+  async open(record) {
+    if (record.encryption !== "none") {
+      throw new Error(
+        `PlainVault cannot open encryption mode "${record.encryption}"`,
+      );
+    }
+    if (typeof record.payload === "string") {
+      throw new Error("PlainVault received ciphertext payload");
+    }
+    return record.payload;
+  }
+}
+
+function createVault(encryptionEnabled) {
+  if (encryptionEnabled) {
+    throw new Error("Encryption not implemented yet");
+  }
+  return new PlainVault();
+}
+
+class MemorySessionStore {
+  constructor(vault = createVault(false)) {
+    this.sessions = new Map();
+    this.days = new Map();
+    this.settings = defaultSettings();
+    this.vault = vault;
+  }
+
+  async getSession(id) {
+    return this.sessions.get(id) ?? null;
+  }
+
+  async putSession(session) {
+    assertSafeStoredSite({
+      domain: session.domain,
+      hostname: session.hostname,
+    });
+    const sealed = await this.vault.seal(session.id, session);
+    const opened = await this.vault.open(sealed);
+    this.sessions.set(session.id, { ...opened });
+  }
+
+  async listSessions() {
+    return [...this.sessions.values()].map((s) => ({ ...s }));
+  }
+
+  async getDay(date) {
+    const day = this.days.get(date);
+    return day ? structuredClone(day) : null;
+  }
+
+  async putDay(day) {
+    this.days.set(day.date, structuredClone(day));
+  }
+
+  async getSettings() {
+    return structuredClone(this.settings);
+  }
+
+  async putSettings(settings) {
+    this.settings = structuredClone(settings);
+  }
+}
+
+function initialRuntimeState(now = 0) {
+  return {
+    sessionId: null,
+    domain: null,
+    hostname: null,
+    categoryId: null,
+    tabId: null,
+    windowId: null,
+    lastTickAt: now || null,
+    chromeFocused: false,
+    idleState: "active",
+    isAccruing: false,
+  };
+}
+
+function deriveTarget(snapshot, settings) {
+  const none = snapshot.windowIdNone ?? WINDOW_ID_NONE;
+  const chromeFocused =
+    snapshot.focusedWindowId !== none && snapshot.focusedWindowId !== undefined;
+
+  const idle = {
+    canAccrue: false,
+    chromeFocused,
+    domain: null,
+    hostname: null,
+    categoryId: "uncategorized",
+    tabId: null,
+    windowId: null,
+  };
+
+  if (!chromeFocused) return idle;
+  if (snapshot.idleState !== "active") return { ...idle, chromeFocused: true };
+  if (!snapshot.activeTab?.active) return idle;
+  if (snapshot.activeTab.windowId !== snapshot.focusedWindowId) return idle;
+
+  const parsed = parseSiteUrl(snapshot.activeTab.url);
+  if (!parsed.trackable) return { ...idle, chromeFocused: true };
+
+  return {
+    canAccrue: true,
+    chromeFocused: true,
+    domain: parsed.domain,
+    hostname: parsed.hostname,
+    title: sanitizeTitle(snapshot.activeTab.title, MAX_TITLE_LENGTH),
+    categoryId: classifySite({
+      domain: parsed.domain,
+      hostname: parsed.hostname,
+      overrides: settings.categoryOverrides,
+    }),
+    tabId: snapshot.activeTab.id,
+    windowId: snapshot.activeTab.windowId,
+  };
+}
+
+function clampDelta(rawMs, maxDeltaMs = MAX_TICK_DELTA_MS) {
+  if (rawMs <= 0) return 0;
+  return Math.min(rawMs, maxDeltaMs);
+}
+
+class TrackingEngine {
+  constructor(
+    store,
+    newId = () => crypto.randomUUID(),
+    maxDeltaMs = MAX_TICK_DELTA_MS,
+  ) {
+    this.store = store;
+    this.newId = newId;
+    this.maxDeltaMs = maxDeltaMs;
+  }
+
+  async handle(event, prev) {
+    const { snapshot } = event;
+    const settings = await this.store.getSettings();
+    const target = deriveTarget(snapshot, settings);
+    const credited = await this.creditElapsed(prev, snapshot.now);
+
+    let state = {
+      ...prev,
+      lastTickAt: snapshot.now,
+      chromeFocused: target.chromeFocused,
+      idleState: snapshot.idleState,
+      isAccruing: false,
+    };
+
+    const switched =
+      Boolean(state.sessionId) &&
+      (state.domain !== target.domain ||
+        state.hostname !== target.hostname ||
+        state.tabId !== target.tabId);
+
+    let closedSessionId = null;
+
+    if (state.sessionId && (!target.canAccrue || switched)) {
+      closedSessionId = await this.closeSession(state.sessionId, snapshot.now);
+      state = {
+        ...state,
+        sessionId: null,
+        domain: null,
+        hostname: null,
+        title: undefined,
+        categoryId: null,
+        tabId: null,
+        windowId: null,
+      };
+    }
+
+    if (target.canAccrue && target.domain && target.hostname) {
+      if (!state.sessionId) {
+        const session = await this.openSession({
+          domain: target.domain,
+          hostname: target.hostname,
+          title: target.title,
+          categoryId: target.categoryId,
+          tabId: target.tabId,
+          windowId: target.windowId,
+          now: snapshot.now,
+        });
+
+        state = {
+          ...state,
+          sessionId: session.id,
+          domain: session.domain,
+          hostname: session.hostname,
+          title: session.title,
+          categoryId: session.categoryId,
+          tabId: session.tabId ?? null,
+          windowId: session.windowId ?? null,
+          isAccruing: true,
+        };
+
+        if (switched) await this.recordTabSwitch(snapshot.now);
+      } else {
+        const sessionId = state.sessionId;
+        state = {
+          ...state,
+          isAccruing: true,
+          title: target.title,
+        };
+        await this.touchSessionTitle(sessionId, target.title);
+      }
+
+      if (
+        event.type === "heartbeat" ||
+        event.type === "recovery" ||
+        event.type === "tab-activated"
+      ) {
+        await this.sampleTabCount(snapshot.now, snapshot.openTabCount);
+      }
+    }
+
+    return { state, creditedMs: credited, switched, closedSessionId };
+  }
+
+  async creditElapsed(prev, now) {
+    if (!prev.isAccruing || !prev.sessionId || prev.lastTickAt == null) {
+      return 0;
+    }
+
+    const raw = now - prev.lastTickAt;
+    if (raw <= 0) return 0;
+
+    const delta = Math.min(raw, this.maxDeltaMs);
+    await this.addActiveMs(prev.sessionId, delta, now);
+    return delta;
+  }
+
+  async addActiveMs(sessionId, delta, now) {
+    const session = await this.store.getSession(sessionId);
+    if (!session) return;
+
+    session.activeMs += delta;
+    await this.store.putSession(session);
+
+    const date = toLocalDateKey(now);
+    const day = (await this.store.getDay(date)) ?? emptyDay(date, now);
+    day.totalActiveMs += delta;
+    day.byCategory[session.categoryId] =
+      (day.byCategory[session.categoryId] ?? 0) + delta;
+    day.byDomain[session.domain] = (day.byDomain[session.domain] ?? 0) + delta;
+    day.updatedAt = now;
+    await this.store.putDay(day);
+  }
+
+  async openSession(input) {
+    const session = {
+      id: this.newId(),
+      domain: input.domain,
+      hostname: input.hostname,
+      categoryId: input.categoryId,
+      startedAt: input.now,
+      activeMs: 0,
+    };
+    if (input.title) session.title = input.title;
+    if (input.tabId != null) session.tabId = input.tabId;
+    if (input.windowId != null) session.windowId = input.windowId;
+
+    await this.store.putSession(session);
+    return session;
+  }
+
+  async closeSession(sessionId, now) {
+    const session = await this.store.getSession(sessionId);
+    if (session && session.endedAt == null) {
+      session.endedAt = now;
+      await this.store.putSession(session);
+    }
+    return sessionId;
+  }
+
+  async touchSessionTitle(sessionId, title) {
+    if (!title) return;
+    const session = await this.store.getSession(sessionId);
+    if (!session || session.title === title) return;
+    session.title = title;
+    await this.store.putSession(session);
+  }
+
+  async recordTabSwitch(now) {
+    const date = toLocalDateKey(now);
+    const day = (await this.store.getDay(date)) ?? emptyDay(date, now);
+    day.tabSwitches += 1;
+    day.updatedAt = now;
+    await this.store.putDay(day);
+  }
+
+  async sampleTabCount(now, count) {
+    if (count < 0) return;
+    const date = toLocalDateKey(now);
+    const day = (await this.store.getDay(date)) ?? emptyDay(date, now);
+    day.tabCountSamples.push(count);
+    if (day.tabCountSamples.length > 500) {
+      day.tabCountSamples = day.tabCountSamples.slice(-500);
+    }
+    day.updatedAt = now;
+    await this.store.putDay(day);
+  }
+}
+
+function scoreProductivity(byCategory, productiveCategories) {
+  const counted = new Set(productiveCategories);
+  let productiveMs = 0;
+  let totalActiveMs = 0;
+
+  for (const [key, ms] of Object.entries(byCategory)) {
+    const value = ms ?? 0;
+    if (value <= 0) continue;
+    totalActiveMs += value;
+    if (counted.has(key)) productiveMs += value;
+  }
+
+  if (totalActiveMs <= 0) {
+    return {
+      percent: null,
+      level: null,
+      productiveMs: 0,
+      totalActiveMs: 0,
+      countedCategories: [...counted],
+    };
+  }
+
+  const percent = (productiveMs / totalActiveMs) * 100;
+  return {
+    percent,
+    level: levelForPercent(percent),
+    productiveMs,
+    totalActiveMs,
+    countedCategories: [...counted],
+  };
+}
+
+function scoreDay(day, productiveCategories) {
+  return scoreProductivity(day.byCategory, productiveCategories);
+}
+
+function levelForPercent(percent) {
+  if (percent <= 25) return "drift";
+  if (percent <= 50) return "mixed";
+  if (percent <= 75) return "focused";
+  return "locked-in";
+}
+
+function levelLabel(level) {
+  switch (level) {
+    case "drift":
+      return "Drift";
+    case "mixed":
+      return "Mixed";
+    case "focused":
+      return "Focused";
+    case "locked-in":
+      return "Locked in";
+  }
+}
+
+function defaultConfigIncludesUncategorized(productiveCategories) {
+  return productiveCategories.includes(DEFAULT_CATEGORY);
+}
