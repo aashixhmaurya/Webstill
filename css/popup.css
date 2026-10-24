@@ -82,3 +82,22 @@ body {
   font-size: 11px;
   color: rgba(143, 163, 152, 0.75);
 }
+
+.open-day {
+  margin: 10px 0 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--green-bright);
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-align: left;
+  cursor: pointer;
+}
+
+.open-day:hover,
+.open-day:focus-visible {
+  color: #e8f0ea;
+  outline: none;
+}

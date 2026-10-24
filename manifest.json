@@ -3,7 +3,10 @@
   "name": "Webstill",
   "version": "0.1.0",
   "description": "Local-first tracking of where your browser time goes — accurate, private, calm.",
-  "permissions": ["tabs", "idle", "storage", "alarms"],
+  "permissions": ["tabs", "idle", "storage", "alarms", "sidePanel"],
+  "side_panel": {
+    "default_path": "html/dashboard.html"
+  },
   "background": {
     "service_worker": "js/background.js",
     "type": "module"

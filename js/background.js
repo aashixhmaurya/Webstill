@@ -866,6 +866,10 @@ async function bootstrap() {
   const settings = await store.getSettings();
   chrome.idle.setDetectionInterval(settings.idleSeconds || DEFAULT_IDLE_SECONDS);
 
+  if (chrome.sidePanel?.setPanelBehavior) {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+  }
+
   ready = true;
 }
 
